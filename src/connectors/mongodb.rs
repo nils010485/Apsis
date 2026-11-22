@@ -1,9 +1,8 @@
-use futures::TryStreamExt;
 use mongodb::bson::{self, Bson, Document};
 use mongodb::options::{ClientOptions, Credential};
-use mongodb::{Client, Collection};
+use mongodb::{Client, Database};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::config::PresetConfig;
 use crate::error::{ApsisError, Result};
@@ -12,40 +11,7 @@ use crate::error::{ApsisError, Result};
 struct MongoQuery {
     #[serde(default)]
     database: Option<String>,
-    #[serde(default)]
-    collection: Option<String>,
-    op: String,
-    #[serde(default)]
-    payload: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FindOptionsPayload {
-    #[serde(default)]
-    filter: Option<Value>,
-    #[serde(default)]
-    limit: Option<i64>,
-    #[serde(default)]
-    skip: Option<u64>,
-    #[serde(default)]
-    sort: Option<Value>,
-    #[serde(default)]
-    projection: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdatePayload {
-    filter: Value,
-    update: Value,
-    #[serde(default)]
-    many: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeletePayload {
-    filter: Value,
-    #[serde(default)]
-    many: bool,
+    command: Value,
 }
 
 /// Build a reusable MongoDB client from a preset.
@@ -94,7 +60,12 @@ pub async fn build_client(preset: &PresetConfig) -> Result<Client> {
         .map_err(|e| ApsisError::Connector(format!("MongoDB client error: {e}")))
 }
 
-/// Execute a MongoDB operation encoded as a JSON object (or JSON string) and return JSON output.
+/// Execute a raw MongoDB command (`runCommand` passthrough) and return the server reply as JSON.
+///
+/// `query` is `{ "database": "...", "command": { ... } }`; `database` is optional and falls back to
+/// the preset's default. The command document is forwarded verbatim, so any operation the
+/// connected user's roles allow is expressible. Cursor replies are drained with `getMore` so the
+/// full result set lands in `cursor.firstBatch`.
 pub async fn execute_query(
     client: &Client,
     default_database: Option<&str>,
@@ -108,8 +79,7 @@ pub async fn execute_query(
             .map_err(|e| ApsisError::InvalidParams(format!("Invalid MongoDB query object: {e}")))?,
         _ => {
             return Err(ApsisError::InvalidParams(
-                "MongoDB query must be a JSON object { database, collection, op, payload }"
-                    .to_string(),
+                "MongoDB query must be a JSON object { database?, command }".to_string(),
             ));
         }
     };
@@ -129,216 +99,70 @@ pub async fn execute_query(
         .to_string();
 
     let db = client.database(&db_name);
+    let command_doc = json_to_doc(parsed.command)?;
 
-    let require_collection = || -> Result<Collection<Document>> {
-        let name = parsed
-            .collection
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                ApsisError::InvalidParams("Missing 'collection' in MongoDB query".to_string())
-            })?;
-        Ok(db.collection::<Document>(name))
-    };
+    let mut reply = db
+        .run_command(command_doc)
+        .await
+        .map_err(|e| ApsisError::Connector(format!("MongoDB command failed: {e}")))?;
 
-    let out: Value = match parsed.op.trim() {
-        "list_collections" => {
-            let names = db.list_collection_names().await.map_err(|e| {
-                ApsisError::Connector(format!("MongoDB list_collections failed: {e}"))
-            })?;
-            json!(names)
-        }
-        "find" => {
-            let coll = require_collection()?;
-            let opts = parse_find_payload(parsed.payload)?;
-            let filter_doc = json_to_doc(opts.filter.unwrap_or_else(|| json!({})))?;
+    drain_cursor(&db, &db_name, &mut reply).await?;
 
-            let mut action = coll.find(filter_doc);
-            if let Some(l) = opts.limit {
-                action = action.limit(l);
-            }
-            if let Some(s) = opts.skip {
-                action = action.skip(s);
-            }
-            if let Some(sort) = opts.sort {
-                action = action.sort(json_to_doc(sort)?);
-            }
-            if let Some(proj) = opts.projection {
-                action = action.projection(json_to_doc(proj)?);
-            }
-
-            let mut cursor = action
-                .await
-                .map_err(|e| ApsisError::Connector(format!("MongoDB find failed: {e}")))?;
-            let mut docs = Vec::new();
-            while let Some(doc) = cursor
-                .try_next()
-                .await
-                .map_err(|e| ApsisError::Connector(format!("MongoDB cursor error: {e}")))?
-            {
-                docs.push(Bson::Document(doc).into_relaxed_extjson());
-            }
-            Value::Array(docs)
-        }
-        "aggregate" => {
-            let coll = require_collection()?;
-            let pipeline_val = match parsed.payload {
-                Some(Value::Array(arr)) => arr,
-                Some(Value::Object(mut map)) => match map.remove("pipeline") {
-                    Some(Value::Array(arr)) => arr,
-                    _ => {
-                        return Err(ApsisError::InvalidParams(
-                            "MongoDB aggregate payload must be a pipeline array".to_string(),
-                        ));
-                    }
-                },
-                _ => {
-                    return Err(ApsisError::InvalidParams(
-                        "MongoDB aggregate requires 'payload' as an array of stages".to_string(),
-                    ));
-                }
-            };
-
-            let pipeline: Vec<Document> = pipeline_val
-                .into_iter()
-                .map(json_to_doc)
-                .collect::<Result<Vec<_>>>()?;
-
-            let mut cursor = coll
-                .aggregate(pipeline)
-                .await
-                .map_err(|e| ApsisError::Connector(format!("MongoDB aggregate failed: {e}")))?;
-            let mut docs = Vec::new();
-            while let Some(doc) = cursor
-                .try_next()
-                .await
-                .map_err(|e| ApsisError::Connector(format!("MongoDB cursor error: {e}")))?
-            {
-                docs.push(Bson::Document(doc).into_relaxed_extjson());
-            }
-            Value::Array(docs)
-        }
-        "insert" => {
-            let coll = require_collection()?;
-            match parsed.payload {
-                Some(Value::Array(items)) => {
-                    let docs: Vec<Document> = items
-                        .into_iter()
-                        .map(json_to_doc)
-                        .collect::<Result<Vec<_>>>()?;
-                    let res = coll.insert_many(docs).await.map_err(|e| {
-                        ApsisError::Connector(format!("MongoDB insert_many failed: {e}"))
-                    })?;
-                    let ids: Vec<Value> = res
-                        .inserted_ids
-                        .into_values()
-                        .map(Bson::into_relaxed_extjson)
-                        .collect();
-                    json!({ "inserted_count": ids.len(), "inserted_ids": ids })
-                }
-                Some(obj @ Value::Object(_)) => {
-                    let doc = json_to_doc(obj)?;
-                    let res = coll.insert_one(doc).await.map_err(|e| {
-                        ApsisError::Connector(format!("MongoDB insert_one failed: {e}"))
-                    })?;
-                    json!({ "inserted_id": res.inserted_id.into_relaxed_extjson() })
-                }
-                _ => {
-                    return Err(ApsisError::InvalidParams(
-                        "MongoDB insert requires 'payload' as a document or array of documents"
-                            .to_string(),
-                    ));
-                }
-            }
-        }
-        "update" => {
-            let coll = require_collection()?;
-            let payload_val = parsed.payload.ok_or_else(|| {
-                ApsisError::InvalidParams(
-                    "MongoDB update requires 'payload' with { filter, update, many? }".to_string(),
-                )
-            })?;
-            let upd: UpdatePayload = serde_json::from_value(payload_val).map_err(|e| {
-                ApsisError::InvalidParams(format!("Invalid MongoDB update payload: {e}"))
-            })?;
-            let filter_doc = json_to_doc(upd.filter)?;
-            let update_doc = json_to_doc(upd.update)?;
-
-            let res = if upd.many {
-                coll.update_many(filter_doc, update_doc).await
-            } else {
-                coll.update_one(filter_doc, update_doc).await
-            }
-            .map_err(|e| ApsisError::Connector(format!("MongoDB update failed: {e}")))?;
-
-            json!({
-                "matched_count": res.matched_count,
-                "modified_count": res.modified_count,
-                "upserted_id": res.upserted_id.map(Bson::into_relaxed_extjson),
-            })
-        }
-        "delete" => {
-            let coll = require_collection()?;
-            let payload_val = parsed.payload.unwrap_or_else(|| json!({}));
-            let (filter_val, many) = if payload_val.get("filter").is_some() {
-                let del: DeletePayload = serde_json::from_value(payload_val).map_err(|e| {
-                    ApsisError::InvalidParams(format!("Invalid MongoDB delete payload: {e}"))
-                })?;
-                (del.filter, del.many)
-            } else {
-                (payload_val, false)
-            };
-            let filter_doc = json_to_doc(filter_val)?;
-            let res = if many {
-                coll.delete_many(filter_doc).await
-            } else {
-                coll.delete_one(filter_doc).await
-            }
-            .map_err(|e| ApsisError::Connector(format!("MongoDB delete failed: {e}")))?;
-
-            json!({ "deleted_count": res.deleted_count })
-        }
-        other => {
-            return Err(ApsisError::InvalidParams(format!(
-                "Unsupported MongoDB op '{other}'. Expected one of: find, aggregate, insert, update, delete, list_collections"
-            )));
-        }
-    };
-
+    let out = Bson::Document(reply).into_relaxed_extjson();
     serde_json::to_string_pretty(&out)
         .map_err(|e| ApsisError::Connector(format!("Failed to serialize MongoDB output: {e}")))
 }
 
-fn parse_find_payload(payload: Option<Value>) -> Result<FindOptionsPayload> {
-    let Some(val) = payload else {
-        return Ok(FindOptionsPayload {
-            filter: None,
-            limit: None,
-            skip: None,
-            sort: None,
-            projection: None,
-        });
+/// Follow a command's cursor with `getMore` until exhausted, merging every batch into
+/// `cursor.firstBatch` and resetting `cursor.id` to 0. No-op for replies without a live cursor.
+async fn drain_cursor(db: &Database, db_name: &str, reply: &mut Document) -> Result<()> {
+    let Ok(cursor) = reply.get_document_mut("cursor") else {
+        return Ok(());
     };
-    if let Value::Object(ref map) = val {
-        let is_options_wrapper = map.contains_key("filter")
-            || map.contains_key("limit")
-            || map.contains_key("skip")
-            || map.contains_key("sort")
-            || map.contains_key("projection");
-        if is_options_wrapper {
-            return serde_json::from_value(val).map_err(|e| {
-                ApsisError::InvalidParams(format!("Invalid MongoDB find options: {e}"))
-            });
-        }
+    let mut id = bson_int(cursor.get("id"));
+    if id == 0 {
+        return Ok(());
     }
-    Ok(FindOptionsPayload {
-        filter: Some(val),
-        limit: None,
-        skip: None,
-        sort: None,
-        projection: None,
-    })
+
+    let ns = cursor.get_str("ns").unwrap_or_default().to_string();
+    let prefix = format!("{db_name}.");
+    let collection = ns.strip_prefix(&prefix).unwrap_or(&ns).to_string();
+
+    let mut docs: Vec<Bson> = cursor
+        .get_array("firstBatch")
+        .map(|batch| batch.to_vec())
+        .unwrap_or_default();
+
+    while id != 0 {
+        let get_more = bson::doc! {
+            "getMore": id,
+            "collection": &collection,
+            "batchSize": 1000,
+        };
+        let more = db
+            .run_command(get_more)
+            .await
+            .map_err(|e| ApsisError::Connector(format!("MongoDB getMore failed: {e}")))?;
+        let next = more.get_document("cursor").map_err(|e| {
+            ApsisError::Connector(format!("MongoDB getMore reply missing cursor: {e}"))
+        })?;
+        if let Ok(batch) = next.get_array("nextBatch") {
+            docs.extend(batch.iter().cloned());
+        }
+        id = bson_int(next.get("id"));
+    }
+
+    cursor.insert("firstBatch", docs);
+    cursor.insert("id", 0i64);
+    Ok(())
+}
+
+fn bson_int(value: Option<&Bson>) -> i64 {
+    match value {
+        Some(Bson::Int64(n)) => *n,
+        Some(Bson::Int32(n)) => i64::from(*n),
+        _ => 0,
+    }
 }
 
 fn json_to_doc(value: Value) -> Result<Document> {

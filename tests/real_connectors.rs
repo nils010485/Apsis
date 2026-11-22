@@ -254,37 +254,44 @@ fn real_postgres_mongodb_and_s3_e2e() {
     assert_eq!(rows[1]["name"], "beta");
     assert_eq!(rows[1]["active"], false);
 
-    // MongoDB insert, list_collections, find, aggregate, update, delete
+    // MongoDB raw runCommand passthrough: insert, listCollections, find, aggregate, update, delete
     let (err, m_ins) = mcp.call_tool(
         "db_query",
         json!({
             "preset": "real-mongo",
             "query": {
                 "database": mongo_db,
-                "collection": "orders",
-                "op": "insert",
-                "payload": [
-                    { "item": "book", "qty": 2, "status": "paid" },
-                    { "item": "pen", "qty": 5, "status": "paid" },
-                    { "item": "bag", "qty": 1, "status": "pending" }
-                ]
+                "command": {
+                    "insert": "orders",
+                    "documents": [
+                        { "item": "book", "qty": 2, "status": "paid" },
+                        { "item": "pen", "qty": 5, "status": "paid" },
+                        { "item": "bag", "qty": 1, "status": "pending" }
+                    ]
+                }
             }
         }),
     );
     assert!(!err, "mongo insert failed: {m_ins}");
     let m_ins_json: Value = serde_json::from_str(&m_ins).unwrap();
-    assert_eq!(m_ins_json["inserted_count"], 3);
+    assert_eq!(m_ins_json["n"], 3);
 
     let (err, m_colls) = mcp.call_tool(
         "db_query",
         json!({
             "preset": "real-mongo",
-            "query": { "database": mongo_db, "op": "list_collections" }
+            "query": { "database": mongo_db, "command": { "listCollections": 1, "nameOnly": true } }
         }),
     );
-    assert!(!err, "mongo list_collections failed: {m_colls}");
-    let colls: Vec<String> = serde_json::from_str(&m_colls).unwrap();
-    assert!(colls.contains(&"orders".to_string()));
+    assert!(!err, "mongo listCollections failed: {m_colls}");
+    let colls: Value = serde_json::from_str(&m_colls).unwrap();
+    let names: Vec<&str> = colls["cursor"]["firstBatch"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"orders"));
 
     let (err, m_find) = mcp.call_tool(
         "db_query",
@@ -292,9 +299,8 @@ fn real_postgres_mongodb_and_s3_e2e() {
             "preset": "real-mongo",
             "query": {
                 "database": mongo_db,
-                "collection": "orders",
-                "op": "find",
-                "payload": {
+                "command": {
+                    "find": "orders",
                     "filter": { "status": "paid" },
                     "sort": { "qty": -1 },
                     "limit": 1,
@@ -304,8 +310,11 @@ fn real_postgres_mongodb_and_s3_e2e() {
         }),
     );
     assert!(!err, "mongo find failed: {m_find}");
-    let found: Vec<Value> = serde_json::from_str(&m_find).unwrap();
-    assert_eq!(found, vec![json!({ "item": "pen", "qty": 5 })]);
+    let found: Value = serde_json::from_str(&m_find).unwrap();
+    assert_eq!(
+        found["cursor"]["firstBatch"],
+        json!([{ "item": "pen", "qty": 5 }])
+    );
 
     let (err, m_agg) = mcp.call_tool(
         "db_query",
@@ -313,19 +322,22 @@ fn real_postgres_mongodb_and_s3_e2e() {
             "preset": "real-mongo",
             "query": {
                 "database": mongo_db,
-                "collection": "orders",
-                "op": "aggregate",
-                "payload": [
-                    { "$match": { "status": "paid" } },
-                    { "$group": { "_id": "$status", "total_qty": { "$sum": "$qty" } } }
-                ]
+                "command": {
+                    "aggregate": "orders",
+                    "pipeline": [
+                        { "$match": { "status": "paid" } },
+                        { "$group": { "_id": "$status", "total_qty": { "$sum": "$qty" } } }
+                    ],
+                    "cursor": {}
+                }
             }
         }),
     );
     assert!(!err, "mongo aggregate failed: {m_agg}");
-    let agg: Vec<Value> = serde_json::from_str(&m_agg).unwrap();
-    assert_eq!(agg[0]["_id"], "paid");
-    assert_eq!(agg[0]["total_qty"], 7);
+    let agg: Value = serde_json::from_str(&m_agg).unwrap();
+    let agg_batch = agg["cursor"]["firstBatch"].as_array().unwrap();
+    assert_eq!(agg_batch[0]["_id"], "paid");
+    assert_eq!(agg_batch[0]["total_qty"], 7);
 
     let (err, m_upd) = mcp.call_tool(
         "db_query",
@@ -333,18 +345,18 @@ fn real_postgres_mongodb_and_s3_e2e() {
             "preset": "real-mongo",
             "query": {
                 "database": mongo_db,
-                "collection": "orders",
-                "op": "update",
-                "payload": {
-                    "filter": { "item": "bag" },
-                    "update": { "$set": { "status": "cancelled" } }
+                "command": {
+                    "update": "orders",
+                    "updates": [
+                        { "q": { "item": "bag" }, "u": { "$set": { "status": "cancelled" } } }
+                    ]
                 }
             }
         }),
     );
     assert!(!err, "mongo update failed: {m_upd}");
     let upd: Value = serde_json::from_str(&m_upd).unwrap();
-    assert_eq!(upd["modified_count"], 1);
+    assert_eq!(upd["nModified"], 1);
 
     let (err, m_del) = mcp.call_tool(
         "db_query",
@@ -352,15 +364,62 @@ fn real_postgres_mongodb_and_s3_e2e() {
             "preset": "real-mongo",
             "query": {
                 "database": mongo_db,
-                "collection": "orders",
-                "op": "delete",
-                "payload": { "filter": { "item": "bag" } }
+                "command": {
+                    "delete": "orders",
+                    "deletes": [ { "q": { "item": "bag" }, "limit": 1 } ]
+                }
             }
         }),
     );
     assert!(!err, "mongo delete failed: {m_del}");
     let del: Value = serde_json::from_str(&m_del).unwrap();
-    assert_eq!(del["deleted_count"], 1);
+    assert_eq!(del["n"], 1);
+
+    // Cursor draining: batchSize 2 over 5 matching docs forces getMore rounds.
+    let (err, m_bulk) = mcp.call_tool(
+        "db_query",
+        json!({
+            "preset": "real-mongo",
+            "query": {
+                "database": mongo_db,
+                "command": {
+                    "insert": "orders",
+                    "documents": [
+                        { "item": "drain", "qty": 1 },
+                        { "item": "drain", "qty": 2 },
+                        { "item": "drain", "qty": 3 },
+                        { "item": "drain", "qty": 4 },
+                        { "item": "drain", "qty": 5 }
+                    ]
+                }
+            }
+        }),
+    );
+    assert!(!err, "mongo bulk insert failed: {m_bulk}");
+
+    let (err, m_drain) = mcp.call_tool(
+        "db_query",
+        json!({
+            "preset": "real-mongo",
+            "query": {
+                "database": mongo_db,
+                "command": {
+                    "find": "orders",
+                    "filter": { "item": "drain" },
+                    "sort": { "qty": 1 },
+                    "batchSize": 2,
+                    "projection": { "_id": 0, "qty": 1 }
+                }
+            }
+        }),
+    );
+    assert!(!err, "mongo drained find failed: {m_drain}");
+    let drained: Value = serde_json::from_str(&m_drain).unwrap();
+    assert_eq!(drained["cursor"]["id"], 0);
+    assert_eq!(
+        drained["cursor"]["firstBatch"],
+        json!([{ "qty": 1 }, { "qty": 2 }, { "qty": 3 }, { "qty": 4 }, { "qty": 5 }])
+    );
 
     // S3 list_buckets, put_object, list_objects, get_object, delete_object
     let (err, s3_buckets) = mcp.call_tool(

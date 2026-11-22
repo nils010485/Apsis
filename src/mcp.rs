@@ -17,7 +17,12 @@ use crate::spillover;
 pub struct DbQueryParams {
     /// Name of the connected preset to query.
     pub preset: String,
-    /// For PostgreSQL: raw SQL string. For MongoDB: JSON object { "database": "...", "collection": "...", "op": "find|aggregate|insert|update|delete|list_collections", "payload": ... }.
+    /// For PostgreSQL: raw SQL string. For MongoDB: JSON object { "database": "...", "command": { ... } } — a raw runCommand passthrough.
+    /// `command` is any MongoDB command document, e.g. { "find": "users", "filter": { "age": { "$gt": 18 } }, "limit": 10 },
+    /// { "aggregate": "users", "pipeline": [ ... ], "cursor": {} }, { "insert": "users", "documents": [ ... ] },
+    /// { "update": "users", "updates": [{ "q": { ... }, "u": { ... }, "multi": true }] },
+    /// { "delete": "users", "deletes": [{ "q": { ... }, "limit": 0 }] }, or { "listCollections": 1 }.
+    /// `database` is optional and falls back to the preset default. Cursor replies are fully drained via getMore.
     pub query: Value,
     /// Optional inline wait duration in milliseconds before returning a background job_id (defaults to APSIS_INLINE_WAIT_MS or 20000ms).
     #[serde(default)]
@@ -118,10 +123,10 @@ impl ApsisMcpServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
-    /// Execute a PostgreSQL SQL query or MongoDB JSON operation against a connected preset.
+    /// Execute a PostgreSQL SQL query or a raw MongoDB runCommand against a connected preset.
     #[tool(
         name = "db_query",
-        description = "Execute a query against a connected PostgreSQL (raw SQL string) or MongoDB (JSON { database, collection, op, payload }) preset. If execution exceeds the inline wait window (20s by default), returns a job_id to poll via job_status. Large results spill over to /tmp/."
+        description = "Execute a query against a connected preset. PostgreSQL: 'query' is a raw SQL string. MongoDB: 'query' is JSON { database?, command } where command is a raw runCommand document forwarded verbatim, e.g. { \"find\": \"users\", \"filter\": { \"age\": { \"$gt\": 18 } }, \"limit\": 10 }; database is optional (preset default) and cursor replies are fully drained. If execution exceeds the inline wait window (20s by default), returns a job_id to poll via job_status. Large results spill over to /tmp/."
     )]
     async fn db_query(
         &self,
