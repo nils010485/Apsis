@@ -23,7 +23,6 @@ fn cli_lifecycle_flags_and_interactive() {
     let cfg_dir = temp_dir("cli");
     fs::create_dir_all(&cfg_dir).unwrap();
 
-    // 1. Add postgres preset via flags
     let out = Command::new(apsis_bin())
         .env("APSIS_CONFIG_DIR", &cfg_dir)
         .args([
@@ -50,7 +49,6 @@ fn cli_lifecycle_flags_and_interactive() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 2. Add S3 preset via interactive prompt
     let mut child = Command::new(apsis_bin())
         .env("APSIS_CONFIG_DIR", &cfg_dir)
         .args(["add", "logs-s3"])
@@ -75,7 +73,6 @@ fn cli_lifecycle_flags_and_interactive() {
         String::from_utf8_lossy(&interactive_out.stderr)
     );
 
-    // Verify 0600 permissions on presets.toml
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -87,7 +84,6 @@ fn cli_lifecycle_flags_and_interactive() {
         assert_eq!(mode, 0o600);
     }
 
-    // 3. ls shows disconnected and masks secrets
     let ls_out = Command::new(apsis_bin())
         .env("APSIS_CONFIG_DIR", &cfg_dir)
         .args(["ls"])
@@ -101,7 +97,6 @@ fn cli_lifecycle_flags_and_interactive() {
     assert!(!ls_stdout.contains("top-secret-pg"));
     assert!(!ls_stdout.contains("top-secret-s3"));
 
-    // 4. connect dev-pg and logs-s3
     for name in ["dev-pg", "logs-s3"] {
         let c = Command::new(apsis_bin())
             .env("APSIS_CONFIG_DIR", &cfg_dir)
@@ -120,7 +115,6 @@ fn cli_lifecycle_flags_and_interactive() {
     assert!(ls_conn_stdout.contains("dev-pg [connected]"));
     assert!(ls_conn_stdout.contains("logs-s3 [connected]"));
 
-    // 5. disconnect --all
     let disc_all = Command::new(apsis_bin())
         .env("APSIS_CONFIG_DIR", &cfg_dir)
         .args(["disconnect", "--all"])
@@ -128,7 +122,6 @@ fn cli_lifecycle_flags_and_interactive() {
         .unwrap();
     assert!(disc_all.status.success());
 
-    // 6. connect then rm
     assert!(
         Command::new(apsis_bin())
             .env("APSIS_CONFIG_DIR", &cfg_dir)
@@ -158,7 +151,6 @@ fn mcp_stdio_roundtrip() {
     let cfg_dir = temp_dir("mcp-stdio");
     fs::create_dir_all(&cfg_dir).unwrap();
 
-    // Add preset (disconnected initially)
     assert!(
         Command::new(apsis_bin())
             .env("APSIS_CONFIG_DIR", &cfg_dir)
@@ -209,7 +201,6 @@ fn mcp_stdio_roundtrip() {
         serde_json::from_str(line.trim()).unwrap()
     };
 
-    // 1. Initialize
     send_msg(json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -224,13 +215,11 @@ fn mcp_stdio_roundtrip() {
     assert_eq!(init_resp["id"], 1);
     assert!(init_resp["result"].is_object());
 
-    // 2. Initialized notification
     send_msg(json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     }));
 
-    // 3. tools/list -> 4 tools
     send_msg(json!({
         "jsonrpc": "2.0",
         "id": 2,
@@ -245,7 +234,6 @@ fn mcp_stdio_roundtrip() {
         vec!["db_query", "job_status", "list_connections", "s3_action"]
     );
 
-    // 4. list_connections when empty
     send_msg(json!({
         "jsonrpc": "2.0",
         "id": 3,
@@ -258,7 +246,6 @@ fn mcp_stdio_roundtrip() {
         "No active connections."
     );
 
-    // 5. Connect dev-pg using CLI while MCP server is running (stateless reload check)
     assert!(
         Command::new(apsis_bin())
             .env("APSIS_CONFIG_DIR", &cfg_dir)
@@ -282,7 +269,6 @@ fn mcp_stdio_roundtrip() {
     assert!(active_text.contains("***"));
     assert!(!active_text.contains("never-leak-this"));
 
-    // 6. Call db_query on disconnected preset -> Preset not connected
     assert!(
         Command::new(apsis_bin())
             .env("APSIS_CONFIG_DIR", &cfg_dir)

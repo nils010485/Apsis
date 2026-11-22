@@ -6,11 +6,9 @@ use serde::Serialize;
 
 use crate::error::Result;
 
-/// Default inline threshold: 50 KiB.
 pub const DEFAULT_MAX_INLINE_BYTES: usize = 50 * 1024;
 pub const PREVIEW_CHAR_LIMIT: usize = 1000;
 
-/// Result of applying the inline-size threshold to a serialized tool payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpilloverResult {
     Inline(String),
@@ -29,7 +27,6 @@ struct SpilledEnvelope<'a> {
     preview: &'a str,
 }
 
-/// Resolve the maximum inline byte threshold from `APSIS_MAX_INLINE_BYTES` or default (50 KiB).
 pub fn max_inline_bytes() -> usize {
     std::env::var("APSIS_MAX_INLINE_BYTES")
         .ok()
@@ -37,8 +34,6 @@ pub fn max_inline_bytes() -> usize {
         .unwrap_or(DEFAULT_MAX_INLINE_BYTES)
 }
 
-/// Apply the spillover threshold, writing full content to `/tmp/apsis-<preset>-<timestamp>.<ext>`
-/// if it exceeds `threshold_bytes`.
 pub fn apply_spillover_with_dir(
     preset: &str,
     content: &str,
@@ -76,8 +71,6 @@ pub fn apply_spillover_with_dir(
     })
 }
 
-/// Apply spillover using `/tmp` and `APSIS_MAX_INLINE_BYTES` (default 50 KiB), formatting
-/// the result as text ready for an MCP `ContentBlock::text` response.
 pub fn format_mcp_output(preset: &str, content: &str, ext: &str) -> Result<String> {
     let dir = PathBuf::from("/tmp");
     let outcome = apply_spillover_with_dir(preset, content, ext, max_inline_bytes(), &dir)?;

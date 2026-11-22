@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use crate::config::PresetConfig;
 use crate::error::{ApsisError, Result};
 
-/// Supported S3 actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum S3ActionKind {
@@ -34,7 +33,6 @@ impl std::str::FromStr for S3ActionKind {
     }
 }
 
-/// Output of an S3 action, including spillover extension hint (`json` or `txt`).
 pub struct S3ActionOutput {
     pub content: String,
     pub extension: &'static str,
@@ -62,7 +60,6 @@ struct ListObjectsResponse {
     objects: Vec<ObjectInfo>,
 }
 
-/// Build an S3 client from a preset, forcing path-style when a custom endpoint is set.
 pub fn build_s3_client(
     endpoint: Option<&str>,
     region: &str,
@@ -307,7 +304,6 @@ mod tests {
             "AKIA",
             "SECRET",
         );
-        // Ensuring client construction succeeds without panicking and config matches.
         assert_eq!(
             client.config().region().map(|r| r.as_ref()),
             Some("eu-west-1")

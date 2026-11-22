@@ -11,7 +11,6 @@ use crate::error::{ApsisError, Result};
 
 const DEFAULT_PG_MAX_CONNECTIONS: u32 = 5;
 
-/// Build a lazy PostgreSQL connection pool for a preset.
 pub fn build_pool(preset: &PresetConfig) -> Result<PgPool> {
     let PresetConfig::Postgres {
         host,
@@ -39,7 +38,6 @@ pub fn build_pool(preset: &PresetConfig) -> Result<PgPool> {
         .connect_lazy_with(opts))
 }
 
-/// Execute a raw SQL query against a PostgreSQL pool and serialize the result as JSON.
 pub async fn execute_query(pool: &PgPool, sql: &str) -> Result<String> {
     if sql.trim().is_empty() {
         return Err(ApsisError::InvalidParams(

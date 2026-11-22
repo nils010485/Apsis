@@ -27,7 +27,6 @@ struct JobEntry {
     finished_at: Option<Instant>,
 }
 
-/// Manages background execution of slow queries so MCP calls stay under client timeouts.
 #[derive(Default)]
 pub struct JobManager {
     jobs: Arc<Mutex<HashMap<String, JobEntry>>>,
@@ -45,7 +44,6 @@ impl JobManager {
         Self::default()
     }
 
-    /// Resolve the inline wait duration from explicit param, `APSIS_INLINE_WAIT_MS`, or 20s default.
     pub fn resolve_wait_duration(wait_ms: Option<u64>) -> Duration {
         let ms = wait_ms.unwrap_or_else(|| {
             std::env::var("APSIS_INLINE_WAIT_MS")
@@ -56,7 +54,6 @@ impl JobManager {
         Duration::from_millis(ms)
     }
 
-    /// Spawn a query task and wait up to `wait` for completion before returning a `job_id`.
     pub async fn run_with_wait<F>(&self, preset: String, wait: Duration, fut: F) -> WaitOutcome
     where
         F: Future<Output = Result<String, String>> + Send + 'static,
@@ -99,7 +96,6 @@ impl JobManager {
         self.wait_inner(&job_id, &mut rx, wait).await
     }
 
-    /// Poll or long-poll an existing job, optionally cancelling it.
     pub async fn poll(
         &self,
         job_id: &str,
@@ -124,7 +120,6 @@ impl JobManager {
         Some((preset, outcome))
     }
 
-    /// Cancel and remove any active/finished jobs belonging to a disconnected preset.
     pub async fn cancel_for_preset(&self, preset: &str) {
         let mut guard = self.jobs.lock().await;
         let ids: Vec<String> = guard
@@ -195,7 +190,6 @@ mod tests {
     async fn returns_inline_when_fast_and_job_id_when_slow() {
         let mgr = JobManager::new();
 
-        // Fast job completes within wait window
         let fast = mgr
             .run_with_wait("pg".to_string(), Duration::from_millis(500), async {
                 Ok("fast-ok".to_string())
@@ -203,7 +197,6 @@ mod tests {
             .await;
         assert!(matches!(fast, WaitOutcome::Completed(ref s) if s == "fast-ok"));
 
-        // Slow job promotes to background job_id, then completes on poll
         let slow = mgr
             .run_with_wait("mongo".to_string(), Duration::from_millis(20), async {
                 tokio::time::sleep(Duration::from_millis(80)).await;

@@ -9,7 +9,6 @@ use crate::error::{ApsisError, Result};
 
 pub const MASKED_SECRET: &str = "***";
 
-/// Supported connection protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -28,7 +27,6 @@ impl std::fmt::Display for Protocol {
     }
 }
 
-/// Configuration for a single connection preset stored in `presets.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "lowercase")]
 pub enum PresetConfig {
@@ -82,7 +80,6 @@ fn default_s3_region() -> String {
     "us-east-1".to_string()
 }
 
-/// Public, secret-masked view of a preset exposed to CLI `ls` and MCP `list_connections`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaskedPresetInfo {
     pub name: String,
@@ -113,7 +110,6 @@ impl PresetConfig {
         }
     }
 
-    /// Return a masked representation that never exposes passwords or secret keys.
     pub fn masked(&self, name: &str) -> MaskedPresetInfo {
         match self {
             PresetConfig::Postgres {
@@ -178,28 +174,24 @@ impl PresetConfig {
     }
 }
 
-/// Contents of `presets.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresetsFile {
     #[serde(default)]
     pub presets: BTreeMap<String, PresetConfig>,
 }
 
-/// Contents of `state.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateFile {
     #[serde(default)]
     pub active: Vec<String>,
 }
 
-/// Resolves and manages `presets.toml` and `state.json` inside a config directory.
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     dir: PathBuf,
 }
 
 impl ConfigStore {
-    /// Create a store using `APSIS_CONFIG_DIR` if set, otherwise `~/.config/apsis/`.
     pub fn default_store() -> Result<Self> {
         if let Ok(custom) = std::env::var("APSIS_CONFIG_DIR") {
             let trimmed = custom.trim();
@@ -219,7 +211,6 @@ impl ConfigStore {
         })
     }
 
-    /// Create a store rooted at an explicit directory (primarily for tests).
     #[allow(dead_code)]
     pub fn with_dir(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -373,7 +364,6 @@ impl ConfigStore {
         Ok(count)
     }
 
-    /// Load both `state.json` and `presets.toml` and resolve an active preset.
     pub fn resolve_active_preset(&self, name: &str) -> Result<PresetConfig> {
         let state = self.load_state()?;
         if !state.active.iter().any(|item| item == name) {
@@ -387,7 +377,6 @@ impl ConfigStore {
             .ok_or_else(|| ApsisError::PresetNotFound(name.to_string()))
     }
 
-    /// Return masked metadata for all currently connected presets.
     pub fn list_active_masked(&self) -> Result<Vec<MaskedPresetInfo>> {
         let state = self.load_state()?;
         let presets = self.load_presets()?;

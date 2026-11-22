@@ -61,8 +61,6 @@ pub struct S3ActionParams {
     pub body: Option<String>,
 }
 
-/// Stateless MCP server reloading `state.json` and `presets.toml` on every tool call,
-/// while pooling active clients and tracking slow background jobs in memory.
 #[derive(Clone)]
 pub struct ApsisMcpServer {
     store: ConfigStore,
@@ -98,7 +96,6 @@ impl ApsisMcpServer {
 
 #[tool_router]
 impl ApsisMcpServer {
-    /// List all currently connected presets (with passwords masked).
     #[tool(
         name = "list_connections",
         description = "List all currently connected database and S3 presets (passwords are always masked). Reloads state.json and presets.toml on each call."
@@ -123,7 +120,6 @@ impl ApsisMcpServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
-    /// Execute a PostgreSQL SQL query or a raw MongoDB runCommand against a connected preset.
     #[tool(
         name = "db_query",
         description = "Execute a query against a connected preset. PostgreSQL: 'query' is a raw SQL string. MongoDB: 'query' is JSON { database?, command } where command is a raw runCommand document forwarded verbatim, e.g. { \"find\": \"users\", \"filter\": { \"age\": { \"$gt\": 18 } }, \"limit\": 10 }; database is optional (preset default) and cursor replies are fully drained. If execution exceeds the inline wait window (20s by default), returns a job_id to poll via job_status. Large results spill over to /tmp/."
@@ -194,7 +190,6 @@ impl ApsisMcpServer {
         ))
     }
 
-    /// Poll, long-poll, or cancel a slow background db_query job.
     #[tool(
         name = "job_status",
         description = "Check status of a background db_query job by job_id (long-polls up to wait_ms, 20s by default), or cancel it."
@@ -224,7 +219,6 @@ impl ApsisMcpServer {
         ))
     }
 
-    /// Execute an S3 action against a connected S3 preset.
     #[tool(
         name = "s3_action",
         description = "Execute an S3 action (list_buckets, list_objects, get_object, put_object, delete_object) on a connected S3 preset. Large results spill over to /tmp/."
@@ -310,7 +304,6 @@ fn apsis_to_tool_error(err: ApsisError) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(err.to_string())])
 }
 
-/// Start the stateless MCP server over stdin/stdout.
 pub async fn serve_stdio(store: ConfigStore) -> anyhow::Result<()> {
     let server = ApsisMcpServer::new(store);
     let running = server.serve(rmcp::transport::stdio()).await?;
@@ -357,11 +350,9 @@ mod tests {
 
         let server = ApsisMcpServer::new(store.clone());
 
-        // Initially no active connections
         let list1 = server.list_connections().await.unwrap();
         assert_eq!(extract_text(&list1), "No active connections.");
 
-        // Disconnected preset returns explicit error
         let q1 = server
             .db_query(Parameters(DbQueryParams {
                 preset: "dev-pg".to_string(),
@@ -373,7 +364,6 @@ mod tests {
         assert_eq!(q1.is_error, Some(true));
         assert!(extract_text(&q1).contains("Preset not connected"));
 
-        // Connect preset externally -> server immediately sees it on next call
         store.connect_preset("dev-pg").unwrap();
         let list2 = server.list_connections().await.unwrap();
         let text2 = extract_text(&list2);
@@ -381,7 +371,6 @@ mod tests {
         assert!(text2.contains("***"));
         assert!(!text2.contains("super-secret-password"));
 
-        // Calling s3_action on a postgres preset returns explicit error
         let s3_err = server
             .s3_action(Parameters(S3ActionParams {
                 preset: "dev-pg".to_string(),
@@ -396,7 +385,6 @@ mod tests {
         assert_eq!(s3_err.is_error, Some(true));
         assert!(extract_text(&s3_err).contains("not S3"));
 
-        // Disconnect externally -> server immediately blocks access again
         store.disconnect_preset("dev-pg").unwrap();
         let list3 = server.list_connections().await.unwrap();
         assert_eq!(extract_text(&list3), "No active connections.");

@@ -1,6 +1,5 @@
 use thiserror::Error;
 
-/// Domain errors for `apsis`.
 #[derive(Debug, Error)]
 pub enum ApsisError {
     #[error("Preset not connected: {0}")]

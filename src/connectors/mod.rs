@@ -22,7 +22,6 @@ struct CachedEntry {
     client: CachedClient,
 }
 
-/// Lightweight per-preset pool/client cache invalidated whenever `presets.toml` or `state.json` changes.
 #[derive(Default)]
 pub struct ConnectorCache {
     entries: RwLock<HashMap<String, CachedEntry>>,
@@ -33,7 +32,6 @@ impl ConnectorCache {
         Self::default()
     }
 
-    /// Return a cached pool/client matching `cfg`, creating and caching a new one if absent or changed.
     pub async fn get_or_init(&self, name: &str, cfg: &PresetConfig) -> Result<CachedClient> {
         {
             let guard = self.entries.read().await;
@@ -69,7 +67,6 @@ impl ConnectorCache {
         Ok(new_client)
     }
 
-    /// Evict a preset from the cache (e.g. when disconnected or missing).
     pub async fn evict(&self, name: &str) {
         let removed = self.entries.write().await.remove(name);
         if let Some(entry) = removed {
@@ -77,7 +74,6 @@ impl ConnectorCache {
         }
     }
 
-    /// Evict any cached presets that are no longer active.
     pub async fn retain_active(&self, active_names: &[&str]) {
         let active: HashSet<&str> = active_names.iter().copied().collect();
         let evicted: Vec<CachedEntry> = {
@@ -142,7 +138,6 @@ mod tests {
             _ => panic!("expected postgres pools"),
         }
 
-        // Config change replaces and closes old pool
         let cfg2 = pg_cfg("10.0.0.2");
         let c3 = cache.get_or_init("dev-pg", &cfg2).await.unwrap();
         if let CachedClient::Postgres(p1) = c1 {
@@ -152,7 +147,6 @@ mod tests {
             assert!(!p3.is_closed());
         }
 
-        // retain_active evicts disconnected presets and closes their pools
         cache.retain_active(&[]).await;
         if let CachedClient::Postgres(p3) = c3 {
             assert!(p3.is_closed());

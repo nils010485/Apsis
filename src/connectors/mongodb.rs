@@ -14,7 +14,6 @@ struct MongoQuery {
     command: Value,
 }
 
-/// Build a reusable MongoDB client from a preset.
 pub async fn build_client(preset: &PresetConfig) -> Result<Client> {
     let PresetConfig::Mongodb {
         host,
@@ -60,12 +59,6 @@ pub async fn build_client(preset: &PresetConfig) -> Result<Client> {
         .map_err(|e| ApsisError::Connector(format!("MongoDB client error: {e}")))
 }
 
-/// Execute a raw MongoDB command (`runCommand` passthrough) and return the server reply as JSON.
-///
-/// `query` is `{ "database": "...", "command": { ... } }`; `database` is optional and falls back to
-/// the preset's default. The command document is forwarded verbatim, so any operation the
-/// connected user's roles allow is expressible. Cursor replies are drained with `getMore` so the
-/// full result set lands in `cursor.firstBatch`.
 pub async fn execute_query(
     client: &Client,
     default_database: Option<&str>,
@@ -113,8 +106,7 @@ pub async fn execute_query(
         .map_err(|e| ApsisError::Connector(format!("Failed to serialize MongoDB output: {e}")))
 }
 
-/// Follow a command's cursor with `getMore` until exhausted, merging every batch into
-/// `cursor.firstBatch` and resetting `cursor.id` to 0. No-op for replies without a live cursor.
+/// Drain a live cursor via getMore, merging batches into firstBatch and resetting id to 0.
 async fn drain_cursor(db: &Database, db_name: &str, reply: &mut Document) -> Result<()> {
     let Ok(cursor) = reply.get_document_mut("cursor") else {
         return Ok(());

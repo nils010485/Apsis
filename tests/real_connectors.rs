@@ -136,7 +136,6 @@ fn real_postgres_mongodb_and_s3_e2e() {
     let s3_sk = env_or("APSIS_TEST_S3_SECRET_KEY", "s3_secret_do_not_leak");
     let s3_bucket = env_or("APSIS_TEST_S3_BUCKET", "apsis-test");
 
-    // Configure presets via CLI
     for args in [
         vec![
             "add",
@@ -206,7 +205,6 @@ fn real_postgres_mongodb_and_s3_e2e() {
         );
     }
 
-    // 1. Test PostgreSQL, MongoDB, S3 inline
     let mut mcp = McpClient::spawn(&cfg_dir, None);
 
     let (err, list_text) = mcp.call_tool("list_connections", json!({}));
@@ -217,7 +215,6 @@ fn real_postgres_mongodb_and_s3_e2e() {
     assert!(!list_text.contains(&pg_pass));
     assert!(!list_text.contains(&s3_sk));
 
-    // PostgreSQL DDL + DML + SELECT
     let (err, ddl) = mcp.call_tool(
         "db_query",
         json!({
@@ -254,7 +251,6 @@ fn real_postgres_mongodb_and_s3_e2e() {
     assert_eq!(rows[1]["name"], "beta");
     assert_eq!(rows[1]["active"], false);
 
-    // MongoDB raw runCommand passthrough: insert, listCollections, find, aggregate, update, delete
     let (err, m_ins) = mcp.call_tool(
         "db_query",
         json!({
@@ -421,7 +417,6 @@ fn real_postgres_mongodb_and_s3_e2e() {
         json!([{ "qty": 1 }, { "qty": 2 }, { "qty": 3 }, { "qty": 4 }, { "qty": 5 }])
     );
 
-    // S3 list_buckets, put_object, list_objects, get_object, delete_object
     let (err, s3_buckets) = mcp.call_tool(
         "s3_action",
         json!({ "preset": "real-s3", "action": "list_buckets" }),
@@ -476,7 +471,6 @@ fn real_postgres_mongodb_and_s3_e2e() {
     );
     assert!(!err, "s3 delete_object failed: {s3_del}");
 
-    // Slow query background job promotion & job_status polling against real PostgreSQL
     let (err, slow_resp) = mcp.call_tool(
         "db_query",
         json!({
@@ -503,7 +497,6 @@ fn real_postgres_mongodb_and_s3_e2e() {
 
     mcp.close();
 
-    // 2. Test real spillover (.json for Postgres, .txt for S3 get_object)
     let mut mcp_spill = McpClient::spawn(&cfg_dir, Some(100));
 
     let (err, pg_spill) = mcp_spill.call_tool(
