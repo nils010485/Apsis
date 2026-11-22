@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/apsis dist/
+          tar -C dist -czf "apsis-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" apsis
+          sha256sum "apsis-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" > "apsis-${GITHUB_REF_NAME}-linux-x86_64.tar.gz.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apsis-${{ github.ref_name }}-linux-x86_64.tar.gz
+            apsis-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256

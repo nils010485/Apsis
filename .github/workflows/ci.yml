@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit & CLI/MCP tests
+        run: cargo test
+
+      - name: Start E2E containers (PostgreSQL, MongoDB, S3Mock)
+        run: |
+          docker run -d --name apsis-ci-pg -p 15432:5432 \
+            -e POSTGRES_USER=apsis -e POSTGRES_PASSWORD=apsis_pw -e POSTGRES_DB=apsis_test \
+            postgres:17-alpine
+          docker run -d --name apsis-ci-mongo -p 27117:27017 mongo:8.0
+          docker run -d --name apsis-ci-s3 -p 19090:9090 \
+            -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS=apsis-test \
+            -e initialBuckets=apsis-test \
+            adobe/s3mock:latest
+          for i in $(seq 1 40); do docker exec apsis-ci-pg pg_isready -U apsis -d apsis_test >/dev/null 2>&1 && break; sleep 0.5; done
+          for i in $(seq 1 40); do docker exec apsis-ci-mongo mongosh --quiet --eval "db.runCommand({ ping: 1 }).ok" >/dev/null 2>&1 && break; sleep 0.5; done
+          for i in $(seq 1 60); do [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19090/)" != "000" ] && break; sleep 0.5; done
+
+      - name: Real connector E2E tests
+        run: cargo test --test real_connectors -- --ignored --nocapture
+
+      - name: Cleanup containers
+        if: always()
+        run: docker rm -f apsis-ci-pg apsis-ci-mongo apsis-ci-s3 >/dev/null 2>&1 || true
