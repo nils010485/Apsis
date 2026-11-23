@@ -2,12 +2,17 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApsisError, Result};
 
 pub const MASKED_SECRET: &str = "***";
+
+const KEYRING_SERVICE: &str = "apsis";
+const ENV_SECRET_STORE: &str = "APSIS_SECRET_STORE";
+const KEYRING_UNAVAILABLE_HINT: &str = ". If no OS keyring is available (headless server, SSH, CI, container), set APSIS_SECRET_STORE=file to keep secrets in presets.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,15 +32,42 @@ impl std::fmt::Display for Protocol {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresetConfig {
+    Postgres {
+        host: String,
+        port: u16,
+        user: String,
+        password: String,
+        database: String,
+    },
+    Mongodb {
+        host: String,
+        port: u16,
+        user: Option<String>,
+        password: Option<String>,
+        database: Option<String>,
+        uri: Option<String>,
+    },
+    S3 {
+        endpoint: Option<String>,
+        region: String,
+        access_key: String,
+        secret_key: String,
+        bucket: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "lowercase")]
-pub enum PresetConfig {
+enum PresetToml {
     Postgres {
         host: String,
         #[serde(default = "default_postgres_port")]
         port: u16,
         user: String,
-        password: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
         database: String,
     },
     Mongodb {
@@ -58,10 +90,35 @@ pub enum PresetConfig {
         #[serde(default = "default_s3_region")]
         region: String,
         access_key: String,
-        secret_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bucket: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PresetsToml {
+    #[serde(default)]
+    presets: BTreeMap<String, PresetToml>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Secrets {
+    password: Option<String>,
+    secret_key: Option<String>,
+    uri: Option<String>,
+}
+
+impl Secrets {
+    fn iter(&self) -> impl Iterator<Item = (&'static str, Option<&str>)> {
+        [
+            ("password", self.password.as_deref()),
+            ("secret_key", self.secret_key.as_deref()),
+            ("uri", self.uri.as_deref()),
+        ]
+        .into_iter()
+    }
 }
 
 fn default_host() -> String {
@@ -107,6 +164,52 @@ impl PresetConfig {
             PresetConfig::Postgres { .. } => Protocol::Postgres,
             PresetConfig::Mongodb { .. } => Protocol::Mongodb,
             PresetConfig::S3 { .. } => Protocol::S3,
+        }
+    }
+
+    fn to_toml(&self) -> PresetToml {
+        match self {
+            PresetConfig::Postgres {
+                host,
+                port,
+                user,
+                password,
+                database,
+            } => PresetToml::Postgres {
+                host: host.clone(),
+                port: *port,
+                user: user.clone(),
+                password: Some(password.clone()),
+                database: database.clone(),
+            },
+            PresetConfig::Mongodb {
+                host,
+                port,
+                user,
+                password,
+                database,
+                uri,
+            } => PresetToml::Mongodb {
+                host: host.clone(),
+                port: *port,
+                user: user.clone(),
+                password: password.clone(),
+                database: database.clone(),
+                uri: uri.clone(),
+            },
+            PresetConfig::S3 {
+                endpoint,
+                region,
+                access_key,
+                secret_key,
+                bucket,
+            } => PresetToml::S3 {
+                endpoint: endpoint.clone(),
+                region: region.clone(),
+                access_key: access_key.clone(),
+                secret_key: Some(secret_key.clone()),
+                bucket: bucket.clone(),
+            },
         }
     }
 
@@ -174,9 +277,138 @@ impl PresetConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+impl PresetToml {
+    fn strip_secrets(&mut self) -> Secrets {
+        match self {
+            PresetToml::Postgres { password, .. } => Secrets {
+                password: password.take(),
+                ..Secrets::default()
+            },
+            PresetToml::Mongodb { password, uri, .. } => Secrets {
+                password: password.take(),
+                uri: uri.take(),
+                ..Secrets::default()
+            },
+            PresetToml::S3 { secret_key, .. } => Secrets {
+                secret_key: secret_key.take(),
+                ..Secrets::default()
+            },
+        }
+    }
+
+    fn hydrate(
+        self,
+        name: &str,
+        mut lookup: impl FnMut(&str) -> Result<Option<String>>,
+    ) -> Result<PresetConfig> {
+        let mut resolve = |field: &str, inline: Option<String>| match inline {
+            Some(value) => Ok(Some(value)),
+            None => lookup(field),
+        };
+        let required = |field: &str, value: Option<String>| {
+            value.ok_or_else(|| {
+                ApsisError::Config(format!(
+                    "Preset '{name}': secret '{field}' not found. Re-add the preset with `apsis add {name} --force` (secrets are read from the OS keyring unless APSIS_SECRET_STORE=file, and from presets.toml when stored inline)."
+                ))
+            })
+        };
+        match self {
+            PresetToml::Postgres {
+                host,
+                port,
+                user,
+                password,
+                database,
+            } => Ok(PresetConfig::Postgres {
+                host,
+                port,
+                user,
+                password: required("password", resolve("password", password)?)?,
+                database,
+            }),
+            PresetToml::Mongodb {
+                host,
+                port,
+                user,
+                password,
+                database,
+                uri,
+            } => Ok(PresetConfig::Mongodb {
+                host,
+                port,
+                user,
+                password: resolve("password", password)?,
+                database,
+                uri: resolve("uri", uri)?,
+            }),
+            PresetToml::S3 {
+                endpoint,
+                region,
+                access_key,
+                secret_key,
+                bucket,
+            } => Ok(PresetConfig::S3 {
+                endpoint,
+                region,
+                access_key,
+                secret_key: required("secret_key", resolve("secret_key", secret_key)?)?,
+                bucket,
+            }),
+        }
+    }
+}
+
+trait SecretStore: Send + Sync {
+    fn get(&self, preset: &str, field: &str) -> Result<Option<String>>;
+    fn set(&self, preset: &str, field: &str, value: &str) -> Result<()>;
+    fn delete(&self, preset: &str, field: &str) -> Result<()>;
+}
+
+struct OsKeyring;
+
+impl SecretStore for OsKeyring {
+    fn get(&self, preset: &str, field: &str) -> Result<Option<String>> {
+        match entry(preset, field)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(keyring_error(preset, field, err)),
+        }
+    }
+
+    fn set(&self, preset: &str, field: &str, value: &str) -> Result<()> {
+        entry(preset, field)?
+            .set_password(value)
+            .map_err(|err| keyring_error(preset, field, err))
+    }
+
+    fn delete(&self, preset: &str, field: &str) -> Result<()> {
+        match entry(preset, field)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(keyring_error(preset, field, err)),
+        }
+    }
+}
+
+fn entry(preset: &str, field: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, &format!("{preset}/{field}"))
+        .map_err(|err| keyring_error(preset, field, err))
+}
+
+fn keyring_error(preset: &str, field: &str, err: keyring::Error) -> ApsisError {
+    use keyring::Error;
+    let hint = match err {
+        Error::NoStorageAccess(_) | Error::PlatformFailure(_) | Error::NoDefaultStore => {
+            KEYRING_UNAVAILABLE_HINT
+        }
+        _ => "",
+    };
+    ApsisError::Config(format!(
+        "OS keyring error for '{KEYRING_SERVICE}: {preset}/{field}': {err}{hint}"
+    ))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PresetsFile {
-    #[serde(default)]
     pub presets: BTreeMap<String, PresetConfig>,
 }
 
@@ -186,18 +418,49 @@ pub struct StateFile {
     pub active: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretsMode {
+    Keyring,
+    File,
+}
+
+impl SecretsMode {
+    fn from_env() -> Result<Self> {
+        Self::parse(std::env::var(ENV_SECRET_STORE).ok())
+    }
+
+    fn parse(raw: Option<String>) -> Result<Self> {
+        let Some(raw) = raw else {
+            return Ok(Self::Keyring);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "keyring" => Ok(Self::Keyring),
+            "file" => Ok(Self::File),
+            other => Err(ApsisError::Config(format!(
+                "Invalid {ENV_SECRET_STORE} value '{other}': expected 'keyring' or 'file'"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ConfigStore {
     dir: PathBuf,
+    keyring: Option<Arc<dyn SecretStore>>,
 }
 
 impl ConfigStore {
     pub fn default_store() -> Result<Self> {
+        let keyring = match SecretsMode::from_env()? {
+            SecretsMode::Keyring => Some(Arc::new(OsKeyring) as Arc<dyn SecretStore>),
+            SecretsMode::File => None,
+        };
         if let Ok(custom) = std::env::var("APSIS_CONFIG_DIR") {
             let trimmed = custom.trim();
             if !trimmed.is_empty() {
                 return Ok(Self {
                     dir: PathBuf::from(trimmed),
+                    keyring,
                 });
             }
         }
@@ -208,12 +471,24 @@ impl ConfigStore {
             })?;
         Ok(Self {
             dir: base.join("apsis"),
+            keyring,
         })
     }
 
-    #[allow(dead_code)]
-    pub fn with_dir(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+    #[cfg(test)]
+    pub(crate) fn with_dir(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            keyring: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_keyring(dir: impl Into<PathBuf>, keyring: Arc<dyn SecretStore>) -> Self {
+        Self {
+            dir: dir.into(),
+            keyring: Some(keyring),
+        }
     }
 
     pub fn presets_path(&self) -> PathBuf {
@@ -238,24 +513,41 @@ impl ConfigStore {
 
     pub fn load_presets(&self) -> Result<PresetsFile> {
         let path = self.presets_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => {
-                if content.trim().is_empty() {
-                    return Ok(PresetsFile::default());
-                }
-                toml::from_str(&content).map_err(|e| {
-                    ApsisError::Config(format!("Failed to parse {}: {e}", path.display()))
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PresetsFile::default()),
-            Err(e) => Err(e.into()),
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PresetsFile::default()),
+            Err(e) => return Err(e.into()),
+        };
+        if content.trim().is_empty() {
+            return Ok(PresetsFile::default());
         }
+        let disk: PresetsToml = toml::from_str(&content)
+            .map_err(|e| ApsisError::Config(format!("Failed to parse {}: {e}", path.display())))?;
+        let mut presets = BTreeMap::new();
+        for (name, entry) in disk.presets {
+            let lookup = |field: &str| match self.keyring.as_deref() {
+                Some(store) => store.get(&name, field),
+                None => Ok(None),
+            };
+            let cfg = entry.hydrate(&name, lookup)?;
+            presets.insert(name, cfg);
+        }
+        Ok(PresetsFile { presets })
     }
 
     pub fn save_presets(&self, presets: &PresetsFile) -> Result<()> {
         self.ensure_dir()?;
         let path = self.presets_path();
-        let serialized = toml::to_string_pretty(presets)
+        let mut disk = PresetsToml::default();
+        for (name, cfg) in &presets.presets {
+            let mut entry = cfg.to_toml();
+            if let Some(store) = self.keyring.as_deref() {
+                let secrets = entry.strip_secrets();
+                Self::store_secrets(store, name, &secrets)?;
+            }
+            disk.presets.insert(name.clone(), entry);
+        }
+        let serialized = toml::to_string_pretty(&disk)
             .map_err(|e| ApsisError::Config(format!("Failed to serialize presets: {e}")))?;
 
         let mut opts = OpenOptions::new();
@@ -318,6 +610,9 @@ impl ConfigStore {
         if presets.presets.remove(name).is_none() {
             return Err(ApsisError::PresetNotFound(name.to_string()));
         }
+        if let Some(store) = self.keyring.as_deref() {
+            Self::store_secrets(store, name, &Secrets::default())?;
+        }
         self.save_presets(&presets)?;
 
         let mut state = self.load_state()?;
@@ -352,6 +647,16 @@ impl ConfigStore {
             self.save_state(&state)?;
         }
         Ok(removed)
+    }
+
+    fn store_secrets(store: &dyn SecretStore, preset: &str, secrets: &Secrets) -> Result<()> {
+        for (field, value) in secrets.iter() {
+            match value {
+                Some(value) => store.set(preset, field, value)?,
+                None => store.delete(preset, field)?,
+            }
+        }
+        Ok(())
     }
 
     pub fn disconnect_all(&self) -> Result<usize> {
@@ -409,6 +714,7 @@ fn validate_preset_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_dir(tag: &str) -> PathBuf {
@@ -417,6 +723,105 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("apsis-test-{tag}-{nanos}"))
+    }
+
+    struct MemoryKeyring {
+        entries: Mutex<BTreeMap<(String, String), String>>,
+        fail: bool,
+    }
+
+    impl MemoryKeyring {
+        fn new(fail: bool) -> Self {
+            Self {
+                entries: Mutex::new(BTreeMap::new()),
+                fail,
+            }
+        }
+
+        fn check(&self) -> Result<()> {
+            if self.fail {
+                return Err(ApsisError::Config(
+                    "OS keyring error for 'apsis: p/password': locked (simulated)".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn keys(&self) -> Vec<(String, String)> {
+            self.entries.lock().unwrap().keys().cloned().collect()
+        }
+
+        fn clear(&self) {
+            self.entries.lock().unwrap().clear();
+        }
+    }
+
+    impl SecretStore for MemoryKeyring {
+        fn get(&self, preset: &str, field: &str) -> Result<Option<String>> {
+            self.check()?;
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .get(&(preset.to_string(), field.to_string()))
+                .cloned())
+        }
+
+        fn set(&self, preset: &str, field: &str, value: &str) -> Result<()> {
+            self.check()?;
+            self.entries
+                .lock()
+                .unwrap()
+                .insert((preset.to_string(), field.to_string()), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, preset: &str, field: &str) -> Result<()> {
+            self.check()?;
+            self.entries
+                .lock()
+                .unwrap()
+                .remove(&(preset.to_string(), field.to_string()));
+            Ok(())
+        }
+    }
+
+    fn pg_cfg(password: &str) -> PresetConfig {
+        PresetConfig::Postgres {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            user: "admin".to_string(),
+            password: password.to_string(),
+            database: "app".to_string(),
+        }
+    }
+
+    fn s3_cfg(secret_key: &str) -> PresetConfig {
+        PresetConfig::S3 {
+            endpoint: Some("https://s3.example.com".to_string()),
+            region: "eu-west-1".to_string(),
+            access_key: "AKIA123".to_string(),
+            secret_key: secret_key.to_string(),
+            bucket: Some("logs".to_string()),
+        }
+    }
+
+    fn mongo_uri_cfg(uri: &str) -> PresetConfig {
+        PresetConfig::Mongodb {
+            host: "127.0.0.1".to_string(),
+            port: 27017,
+            user: None,
+            password: None,
+            database: None,
+            uri: Some(uri.to_string()),
+        }
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
     }
 
     #[test]
@@ -531,6 +936,200 @@ bucket = "logs"
         assert_eq!(active[1].name, "logs-s3");
         assert_eq!(active[1].password, "***");
         assert_eq!(active[1].bucket.as_deref(), Some("logs"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_store_env_parsing() {
+        assert_eq!(SecretsMode::parse(None).unwrap(), SecretsMode::Keyring);
+        assert_eq!(
+            SecretsMode::parse(Some(String::new())).unwrap(),
+            SecretsMode::Keyring
+        );
+        assert_eq!(
+            SecretsMode::parse(Some(" Keyring ".into())).unwrap(),
+            SecretsMode::Keyring
+        );
+        assert_eq!(
+            SecretsMode::parse(Some("file".into())).unwrap(),
+            SecretsMode::File
+        );
+        let err = SecretsMode::parse(Some("vault".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("APSIS_SECRET_STORE") && err.contains("'keyring' or 'file'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keyring_error_hint_only_for_storage_failures() {
+        let locked = keyring_error(
+            "p",
+            "password",
+            keyring::Error::NoStorageAccess("locked".into()),
+        );
+        let msg = locked.to_string();
+        assert!(
+            msg.contains("apsis: p/password") && msg.contains("locked"),
+            "{msg}"
+        );
+        assert!(msg.contains("APSIS_SECRET_STORE=file"), "{msg}");
+        assert!(
+            keyring_error("p", "password", keyring::Error::NoDefaultStore)
+                .to_string()
+                .contains("APSIS_SECRET_STORE=file")
+        );
+        let too_long =
+            keyring_error("p", "password", keyring::Error::TooLong("user".into(), 100)).to_string();
+        assert!(
+            too_long.contains("apsis: p/password") && !too_long.contains("APSIS_SECRET_STORE"),
+            "{too_long}"
+        );
+    }
+
+    #[test]
+    fn keyring_strips_secrets_from_toml_and_hydrates() {
+        let dir = temp_config_dir("keyring");
+        let keyring = Arc::new(MemoryKeyring::new(false));
+        let store = ConfigStore::with_keyring(&dir, keyring.clone());
+        store
+            .add_preset("dev-pg".into(), pg_cfg("pg-secret-123"), false)
+            .unwrap();
+        store
+            .add_preset("logs-s3".into(), s3_cfg("s3-secret-456"), false)
+            .unwrap();
+        store
+            .add_preset(
+                "mongo".into(),
+                mongo_uri_cfg("mongodb://u:mongo-secret-789@h/db"),
+                false,
+            )
+            .unwrap();
+
+        let toml_src = fs::read_to_string(store.presets_path()).unwrap();
+        for secret in [
+            "pg-secret-123",
+            "s3-secret-456",
+            "mongo-secret-789",
+            "password",
+            "secret_key",
+            "uri",
+        ] {
+            assert!(!toml_src.contains(secret), "{toml_src}");
+        }
+        assert!(
+            toml_src.contains("[presets.dev-pg]") && toml_src.contains("user = \"admin\""),
+            "{toml_src}"
+        );
+        assert_eq!(
+            keyring.keys(),
+            pairs(&[
+                ("dev-pg", "password"),
+                ("logs-s3", "secret_key"),
+                ("mongo", "uri")
+            ])
+        );
+
+        let loaded = store.load_presets().unwrap();
+        assert_eq!(loaded.presets["dev-pg"], pg_cfg("pg-secret-123"));
+        assert_eq!(loaded.presets["logs-s3"], s3_cfg("s3-secret-456"));
+        assert_eq!(
+            loaded.presets["mongo"],
+            mongo_uri_cfg("mongodb://u:mongo-secret-789@h/db")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyring_legacy_inline_preset_loads_then_migrates_on_save() {
+        let dir = temp_config_dir("legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let keyring = Arc::new(MemoryKeyring::new(false));
+        let store = ConfigStore::with_keyring(&dir, keyring.clone());
+        fs::write(
+            dir.join("presets.toml"),
+            "[presets.old-pg]\nprotocol = \"postgres\"\nhost = \"127.0.0.1\"\nport = 5432\nuser = \"admin\"\npassword = \"legacy-secret\"\ndatabase = \"app\"\n",
+        )
+        .unwrap();
+
+        let loaded = store.load_presets().unwrap();
+        assert_eq!(loaded.presets["old-pg"], pg_cfg("legacy-secret"));
+        assert!(keyring.keys().is_empty());
+
+        store
+            .add_preset("new-s3".into(), s3_cfg("new-secret"), false)
+            .unwrap();
+        assert_eq!(
+            keyring.keys(),
+            pairs(&[("new-s3", "secret_key"), ("old-pg", "password")])
+        );
+        let toml_src = fs::read_to_string(store.presets_path()).unwrap();
+        assert!(
+            !toml_src.contains("legacy-secret") && !toml_src.contains("new-secret"),
+            "{toml_src}"
+        );
+        let loaded = store.load_presets().unwrap();
+        assert_eq!(loaded.presets["old-pg"], pg_cfg("legacy-secret"));
+        assert_eq!(loaded.presets["new-s3"], s3_cfg("new-secret"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyring_force_readd_and_remove_update_entries() {
+        let dir = temp_config_dir("keyring-rm");
+        let keyring = Arc::new(MemoryKeyring::new(false));
+        let store = ConfigStore::with_keyring(&dir, keyring.clone());
+        store.add_preset("p".into(), pg_cfg("one"), false).unwrap();
+        assert_eq!(keyring.keys(), pairs(&[("p", "password")]));
+
+        store.add_preset("p".into(), s3_cfg("two"), true).unwrap();
+        assert_eq!(keyring.keys(), pairs(&[("p", "secret_key")]));
+        assert_eq!(store.load_presets().unwrap().presets["p"], s3_cfg("two"));
+
+        assert!(!store.remove_preset("p").unwrap());
+        assert!(keyring.keys().is_empty());
+        assert!(store.load_presets().unwrap().presets.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyring_missing_required_secret_errors_with_remediation() {
+        let dir = temp_config_dir("missing");
+        let keyring = Arc::new(MemoryKeyring::new(false));
+        let store = ConfigStore::with_keyring(&dir, keyring.clone());
+        store.add_preset("p".into(), pg_cfg("one"), false).unwrap();
+        keyring.clear();
+
+        let err = store.load_presets().unwrap_err().to_string();
+        assert!(
+            err.contains("Preset 'p': secret 'password' not found"),
+            "{err}"
+        );
+        assert!(
+            err.contains("apsis add p --force") && err.contains("APSIS_SECRET_STORE=file"),
+            "{err}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyring_failure_leaves_presets_untouched() {
+        let dir = temp_config_dir("failing");
+        let keyring = Arc::new(MemoryKeyring::new(true));
+        let store = ConfigStore::with_keyring(&dir, keyring.clone());
+
+        let err = store
+            .add_preset("p".into(), pg_cfg("one"), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated"), "{err}");
+        assert!(!store.presets_path().exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

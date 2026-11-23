@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -93,6 +93,14 @@ pub struct AddArgs {
     /// S3 secret access key
     #[arg(long)]
     pub secret_key: Option<String>,
+    /// Read the secret (postgres/mongodb password or S3 secret key) from the first line of stdin instead of prompting
+    #[arg(
+        long,
+        conflicts_with("password"),
+        conflicts_with("secret_key"),
+        conflicts_with("uri")
+    )]
+    pub secret_stdin: bool,
     /// Optional default S3 bucket
     #[arg(long)]
     pub bucket: Option<String>,
@@ -205,6 +213,12 @@ fn handle_add(args: AddArgs, store: &ConfigStore) -> Result<()> {
     let mut reader = stdin.lock();
     let mut stdout = io::stdout();
 
+    let stdin_secret = if args.secret_stdin {
+        Some(read_stdin_secret(&mut reader)?)
+    } else {
+        None
+    };
+
     let protocol = match args.protocol {
         Some(p) => Protocol::from(p),
         None => loop {
@@ -234,7 +248,14 @@ fn handle_add(args: AddArgs, store: &ConfigStore) -> Result<()> {
                 resolve_with_default(args.host, &mut reader, &mut stdout, "Host", "127.0.0.1")?;
             let port = resolve_port(args.port, &mut reader, &mut stdout, 5432)?;
             let user = resolve_required(args.user, &mut reader, &mut stdout, "User")?;
-            let password = resolve_required(args.password, &mut reader, &mut stdout, "Password")?;
+            let password = resolve_secret(
+                args.password,
+                "--password",
+                stdin_secret,
+                &mut reader,
+                &mut stdout,
+                "Password",
+            )?;
             let database = resolve_required(args.database, &mut reader, &mut stdout, "Database")?;
             PresetConfig::Postgres {
                 host,
@@ -246,6 +267,7 @@ fn handle_add(args: AddArgs, store: &ConfigStore) -> Result<()> {
         }
         Protocol::Mongodb => {
             if let Some(uri) = args.uri.filter(|s| !s.trim().is_empty()) {
+                warn_secret_flag("--uri");
                 PresetConfig::Mongodb {
                     host: args.host.unwrap_or_else(|| "127.0.0.1".to_string()),
                     port: args.port.unwrap_or(27017),
@@ -260,15 +282,18 @@ fn handle_add(args: AddArgs, store: &ConfigStore) -> Result<()> {
                 let port = resolve_port(args.port, &mut reader, &mut stdout, 27017)?;
                 let user =
                     resolve_optional(args.user, &mut reader, &mut stdout, "User (optional)")?;
-                let password = if user.is_some() {
-                    resolve_optional(
+                let password = if let Some(v) = stdin_secret {
+                    Some(v)
+                } else if user.is_some() {
+                    resolve_optional_secret(
                         args.password,
+                        "--password",
                         &mut reader,
                         &mut stdout,
                         "Password (optional)",
                     )?
                 } else {
-                    args.password
+                    args.password.inspect(|_| warn_secret_flag("--password"))
                 };
                 let database = resolve_optional(
                     args.database,
@@ -297,8 +322,14 @@ fn handle_add(args: AddArgs, store: &ConfigStore) -> Result<()> {
                 resolve_with_default(args.region, &mut reader, &mut stdout, "Region", "us-east-1")?;
             let access_key =
                 resolve_required(args.access_key, &mut reader, &mut stdout, "Access key")?;
-            let secret_key =
-                resolve_required(args.secret_key, &mut reader, &mut stdout, "Secret key")?;
+            let secret_key = resolve_secret(
+                args.secret_key,
+                "--secret-key",
+                stdin_secret,
+                &mut reader,
+                &mut stdout,
+                "Secret key",
+            )?;
             let bucket = resolve_optional(
                 args.bucket,
                 &mut reader,
@@ -417,4 +448,82 @@ fn resolve_port<R: BufRead, W: Write>(
             Err(_) => writeln!(writer, "Invalid port '{raw}'.")?,
         }
     }
+}
+
+fn read_secret_line<R: BufRead>(reader: &mut R, label: &str) -> Result<String> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(ApsisError::InvalidParams(format!(
+            "Unexpected EOF while reading '{label}'"
+        )));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn read_stdin_secret<R: BufRead>(reader: &mut R) -> Result<String> {
+    let secret = read_secret_line(reader, "the secret from stdin")?;
+    if secret.is_empty() {
+        return Err(ApsisError::InvalidParams(
+            "The secret read from stdin is empty".to_string(),
+        ));
+    }
+    Ok(secret)
+}
+
+fn warn_secret_flag(flag: &str) {
+    eprintln!(
+        "Warning: a secret passed with {flag} is exposed in the shell history and process list; prefer the prompt or --secret-stdin."
+    );
+}
+
+fn prompt_secret<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    label: &str,
+) -> Result<String> {
+    if io::stdin().is_terminal() {
+        return Ok(rpassword::prompt_password(format!("{label}: "))?);
+    }
+    write!(writer, "{label}: ")?;
+    writer.flush()?;
+    read_secret_line(reader, label)
+}
+
+fn resolve_secret<R: BufRead, W: Write>(
+    flag: Option<String>,
+    flag_name: &str,
+    stdin_secret: Option<String>,
+    reader: &mut R,
+    writer: &mut W,
+    label: &str,
+) -> Result<String> {
+    if let Some(v) = flag {
+        warn_secret_flag(flag_name);
+        return Ok(v);
+    }
+    if let Some(v) = stdin_secret {
+        return Ok(v);
+    }
+    loop {
+        let v = prompt_secret(reader, writer, label)?;
+        if !v.is_empty() {
+            return Ok(v);
+        }
+        writeln!(writer, "{label} is required.")?;
+    }
+}
+
+fn resolve_optional_secret<R: BufRead, W: Write>(
+    flag: Option<String>,
+    flag_name: &str,
+    reader: &mut R,
+    writer: &mut W,
+    label: &str,
+) -> Result<Option<String>> {
+    if let Some(v) = flag {
+        warn_secret_flag(flag_name);
+        return Ok((!v.is_empty()).then_some(v));
+    }
+    let v = prompt_secret(reader, writer, label)?;
+    Ok((!v.is_empty()).then_some(v))
 }

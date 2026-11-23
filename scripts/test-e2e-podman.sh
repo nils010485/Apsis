@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# No OS keyring is guaranteed here: keep test secrets inline in presets.toml.
+export APSIS_SECRET_STORE=file
+
 PG_CONT="apsis-e2e-pg-$$"
 MONGO_CONT="apsis-e2e-mongo-$$"
 S3_CONT="apsis-e2e-s3-$$"

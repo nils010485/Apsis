@@ -10,6 +10,13 @@ fn apsis_bin() -> &'static str {
     env!("CARGO_BIN_EXE_apsis")
 }
 
+fn apsis_cmd(cfg_dir: &PathBuf) -> Command {
+    let mut cmd = Command::new(apsis_bin());
+    cmd.env("APSIS_CONFIG_DIR", cfg_dir)
+        .env("APSIS_SECRET_STORE", "file");
+    cmd
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27,9 +34,8 @@ struct McpClient {
 
 impl McpClient {
     fn spawn(cfg_dir: &PathBuf, max_inline_bytes: Option<usize>) -> Self {
-        let mut cmd = Command::new(apsis_bin());
-        cmd.env("APSIS_CONFIG_DIR", cfg_dir)
-            .args(["mcp"])
+        let mut cmd = apsis_cmd(cfg_dir);
+        cmd.args(["mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -182,11 +188,7 @@ fn real_postgres_mongodb_and_s3_e2e() {
             &s3_bucket,
         ],
     ] {
-        let out = Command::new(apsis_bin())
-            .env("APSIS_CONFIG_DIR", &cfg_dir)
-            .args(&args)
-            .output()
-            .unwrap();
+        let out = apsis_cmd(&cfg_dir).args(&args).output().unwrap();
         assert!(
             out.status.success(),
             "add failed: {}",
@@ -196,8 +198,7 @@ fn real_postgres_mongodb_and_s3_e2e() {
 
     for name in ["real-pg", "real-mongo", "real-s3"] {
         assert!(
-            Command::new(apsis_bin())
-                .env("APSIS_CONFIG_DIR", &cfg_dir)
+            apsis_cmd(&cfg_dir)
                 .args(["connect", name])
                 .status()
                 .unwrap()

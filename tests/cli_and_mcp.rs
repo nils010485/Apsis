@@ -18,13 +18,19 @@ fn apsis_bin() -> &'static str {
     env!("CARGO_BIN_EXE_apsis")
 }
 
+fn apsis_cmd(cfg_dir: &PathBuf) -> Command {
+    let mut cmd = Command::new(apsis_bin());
+    cmd.env("APSIS_CONFIG_DIR", cfg_dir)
+        .env("APSIS_SECRET_STORE", "file");
+    cmd
+}
+
 #[test]
 fn cli_lifecycle_flags_and_interactive() {
     let cfg_dir = temp_dir("cli");
     fs::create_dir_all(&cfg_dir).unwrap();
 
-    let out = Command::new(apsis_bin())
-        .env("APSIS_CONFIG_DIR", &cfg_dir)
+    let out = apsis_cmd(&cfg_dir)
         .args([
             "add",
             "dev-pg",
@@ -49,8 +55,7 @@ fn cli_lifecycle_flags_and_interactive() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut child = Command::new(apsis_bin())
-        .env("APSIS_CONFIG_DIR", &cfg_dir)
+    let mut child = apsis_cmd(&cfg_dir)
         .args(["add", "logs-s3"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -84,11 +89,7 @@ fn cli_lifecycle_flags_and_interactive() {
         assert_eq!(mode, 0o600);
     }
 
-    let ls_out = Command::new(apsis_bin())
-        .env("APSIS_CONFIG_DIR", &cfg_dir)
-        .args(["ls"])
-        .output()
-        .unwrap();
+    let ls_out = apsis_cmd(&cfg_dir).args(["ls"]).output().unwrap();
     assert!(ls_out.status.success());
     let ls_stdout = String::from_utf8_lossy(&ls_out.stdout);
     assert!(ls_stdout.contains("dev-pg [disconnected]"));
@@ -98,41 +99,33 @@ fn cli_lifecycle_flags_and_interactive() {
     assert!(!ls_stdout.contains("top-secret-s3"));
 
     for name in ["dev-pg", "logs-s3"] {
-        let c = Command::new(apsis_bin())
-            .env("APSIS_CONFIG_DIR", &cfg_dir)
+        let c = apsis_cmd(&cfg_dir)
             .args(["connect", name])
             .output()
             .unwrap();
         assert!(c.status.success());
     }
 
-    let ls_conn = Command::new(apsis_bin())
-        .env("APSIS_CONFIG_DIR", &cfg_dir)
-        .args(["ls"])
-        .output()
-        .unwrap();
+    let ls_conn = apsis_cmd(&cfg_dir).args(["ls"]).output().unwrap();
     let ls_conn_stdout = String::from_utf8_lossy(&ls_conn.stdout);
     assert!(ls_conn_stdout.contains("dev-pg [connected]"));
     assert!(ls_conn_stdout.contains("logs-s3 [connected]"));
 
-    let disc_all = Command::new(apsis_bin())
-        .env("APSIS_CONFIG_DIR", &cfg_dir)
+    let disc_all = apsis_cmd(&cfg_dir)
         .args(["disconnect", "--all"])
         .output()
         .unwrap();
     assert!(disc_all.status.success());
 
     assert!(
-        Command::new(apsis_bin())
-            .env("APSIS_CONFIG_DIR", &cfg_dir)
+        apsis_cmd(&cfg_dir)
             .args(["connect", "dev-pg"])
             .status()
             .unwrap()
             .success()
     );
     assert!(
-        Command::new(apsis_bin())
-            .env("APSIS_CONFIG_DIR", &cfg_dir)
+        apsis_cmd(&cfg_dir)
             .args(["rm", "dev-pg"])
             .status()
             .unwrap()
@@ -152,8 +145,7 @@ fn mcp_stdio_roundtrip() {
     fs::create_dir_all(&cfg_dir).unwrap();
 
     assert!(
-        Command::new(apsis_bin())
-            .env("APSIS_CONFIG_DIR", &cfg_dir)
+        apsis_cmd(&cfg_dir)
             .args([
                 "add",
                 "dev-pg",
@@ -175,8 +167,7 @@ fn mcp_stdio_roundtrip() {
             .success()
     );
 
-    let mut mcp = Command::new(apsis_bin())
-        .env("APSIS_CONFIG_DIR", &cfg_dir)
+    let mut mcp = apsis_cmd(&cfg_dir)
         .args(["mcp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -247,8 +238,7 @@ fn mcp_stdio_roundtrip() {
     );
 
     assert!(
-        Command::new(apsis_bin())
-            .env("APSIS_CONFIG_DIR", &cfg_dir)
+        apsis_cmd(&cfg_dir)
             .args(["connect", "dev-pg"])
             .status()
             .unwrap()
@@ -270,8 +260,7 @@ fn mcp_stdio_roundtrip() {
     assert!(!active_text.contains("never-leak-this"));
 
     assert!(
-        Command::new(apsis_bin())
-            .env("APSIS_CONFIG_DIR", &cfg_dir)
+        apsis_cmd(&cfg_dir)
             .args(["disconnect", "dev-pg"])
             .status()
             .unwrap()
@@ -295,6 +284,109 @@ fn mcp_stdio_roundtrip() {
     drop(stdin);
     let status = mcp.wait().unwrap();
     assert!(status.success());
+
+    let _ = fs::remove_dir_all(&cfg_dir);
+}
+
+#[test]
+fn cli_secret_inputs() {
+    let cfg_dir = temp_dir("secrets");
+    fs::create_dir_all(&cfg_dir).unwrap();
+
+    let flag = apsis_cmd(&cfg_dir)
+        .args([
+            "add",
+            "pg-flag",
+            "--protocol",
+            "postgres",
+            "--host",
+            "127.0.0.1",
+            "--user",
+            "admin",
+            "--password",
+            "pw-from-flag",
+            "--database",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(flag.status.success());
+    let flag_stderr = String::from_utf8_lossy(&flag.stderr);
+    assert!(
+        flag_stderr.contains("Warning: a secret passed with --password"),
+        "{flag_stderr}"
+    );
+    assert!(!flag_stderr.contains("pw-from-flag"));
+
+    let mut child = apsis_cmd(&cfg_dir)
+        .args([
+            "add",
+            "pg-stdin",
+            "--protocol",
+            "postgres",
+            "--secret-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "pw-from-stdin").unwrap();
+        writeln!(stdin, "10.0.0.5").unwrap();
+        writeln!(stdin, "5433").unwrap();
+        writeln!(stdin, "appuser").unwrap();
+        writeln!(stdin, "appdb").unwrap();
+    }
+    let stdin_out = child.wait_with_output().unwrap();
+    assert!(
+        stdin_out.status.success(),
+        "--secret-stdin add failed: {}",
+        String::from_utf8_lossy(&stdin_out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&stdin_out.stderr).contains("Warning"));
+
+    let toml_src = fs::read_to_string(cfg_dir.join("presets.toml")).unwrap();
+    assert!(
+        toml_src.contains("password = \"pw-from-flag\"")
+            && toml_src.contains("password = \"pw-from-stdin\""),
+        "{toml_src}"
+    );
+    assert!(
+        toml_src.contains("host = \"10.0.0.5\"") && toml_src.contains("port = 5433"),
+        "{toml_src}"
+    );
+
+    let conflict = apsis_cmd(&cfg_dir)
+        .args([
+            "add",
+            "pg-x",
+            "--protocol",
+            "postgres",
+            "--secret-stdin",
+            "--password",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(2));
+
+    let mut child = apsis_cmd(&cfg_dir)
+        .args(["add", "pg-e", "--protocol", "postgres", "--secret-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.as_mut().unwrap()).unwrap();
+    let empty = child.wait_with_output().unwrap();
+    assert!(!empty.status.success());
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("The secret read from stdin is empty"),
+        "{}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
 
     let _ = fs::remove_dir_all(&cfg_dir);
 }

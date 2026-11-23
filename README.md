@@ -24,8 +24,13 @@ cargo install --path .
 ## CLI Usage
 
 ```bash
-# Add a preset (interactive prompts for missing fields, or pass flags)
-apsis add dev-pg --protocol postgres --host 127.0.0.1 --port 5432 --user admin --password secret --database app
+# Add a preset (interactive prompts for missing fields; passwords are prompted without echo)
+apsis add dev-pg --protocol postgres --host 127.0.0.1 --port 5432 --user admin --database app
+
+# Or feed the password / S3 secret key on the first line of stdin, e.g. from a password manager
+pass show db/admin | apsis add dev-pg --protocol postgres --host 127.0.0.1 --user admin --database app --secret-stdin
+
+# --password, --secret-key and --uri work too, but warn: they leak into the shell history and process list
 apsis add logs-s3 --protocol s3 --endpoint https://s3.example.com --region eu-west-1 --access-key AKIA... --secret-key secret --bucket logs
 
 # List presets and connection status (secrets masked as ***)
@@ -47,8 +52,19 @@ apsis mcp
 
 Files live in `~/.config/apsis/` (override with `APSIS_CONFIG_DIR`):
 
-- `presets.toml` (`0600` permissions): connection definitions.
+- `presets.toml` (`0600` permissions): connection definitions (hosts, ports, users, databases, buckets…).
 - `state.json`: active presets exposed to the MCP server (`{ "active": ["dev-pg"] }`).
+
+### Secrets
+
+Passwords, S3 secret keys and MongoDB connection URIs are **never written to `presets.toml`**: they live in the OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service such as GNOME Keyring or KeePassXC), one entry per secret under the service `apsis` with the account `<preset>/<field>` (e.g. `dev-pg/password`). `apsis mcp` reads them from the keyring when it reloads the presets, so nothing sensitive sits in the file, in backups or in synced dotfiles.
+
+- Presets created by earlier versions (secrets inline in `presets.toml`) still load; they are moved to the keyring the next time the file is saved (`apsis add` / `apsis rm`).
+- `apsis rm` also deletes the preset's keyring entries.
+- **Headless Linux, SSH, CI and containers** have no Secret Service: set `APSIS_SECRET_STORE=file` to keep secrets inline in `presets.toml` (`0600`) instead. Without it, apsis fails with an explicit error rather than silently writing secrets to disk.
+- On macOS, a locally rebuilt binary (`cargo install`) is a new identity, so the system asks for keychain access once per binary.
+
+For non-interactive input, `--secret-stdin` reads the password (or S3 secret key) from the first line of stdin; the `--password`, `--secret-key` and `--uri` flags are accepted for scripting but print a warning, since command-line arguments leak into the shell history and the process list.
 
 ## MCP Server (`apsis mcp`)
 
